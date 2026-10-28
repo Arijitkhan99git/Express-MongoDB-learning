@@ -218,6 +218,82 @@ async function startServer() {
       }
     });
 
+        // Replace a user completely by id.
+    app.put("/api/users/:id", async (req, res) => {
+      try {
+        const { id } = req.params;
+
+        if (!OBJECT_ID_REGEX.test(id)) {
+          return res.status(400).json({ message: "Invalid user id" });
+        }
+
+        const { first_name, last_name, email } = req.body ?? {};
+
+        // PUT replaces the whole user, so all three fields are required.
+        if (
+          typeof first_name !== "string" ||
+          typeof last_name !== "string" ||
+          typeof email !== "string" ||
+          !first_name.trim() ||
+          !last_name.trim() ||
+          !email.trim()
+        ) {
+          return res.status(400).json({
+            message: "first_name, last_name, and email are required strings",
+          });
+        }
+
+        const cleanEmail = email.trim().toLowerCase();
+
+        if (!EMAIL_REGEX.test(cleanEmail)) {
+          return res.status(400).json({ message: "Invalid email format" });
+        }
+
+        const _id = new ObjectId(id);
+
+        // Fetch the existing user so createdAt can be kept.
+        const existing = await usersCollection.findOne({ _id });
+
+        if (!existing) {
+          return res.status(404).json({ message: "User not found" });
+        }
+
+        const replacement = {
+          first_name: first_name.trim(),
+          last_name: last_name.trim(),
+          email: cleanEmail,
+          updatedAt: new Date(),
+        };
+
+        // Keep the original creation date if the old document had one.
+        if (existing.createdAt) {
+          replacement.createdAt = existing.createdAt;
+        }
+
+        const updatedUser = await usersCollection.findOneAndReplace(
+          { _id },
+          replacement,
+          { returnDocument: "after" }
+        );
+
+        // Null only if the user was deleted between the two calls.
+        if (!updatedUser) {
+          return res.status(404).json({ message: "User not found" });
+        }
+
+        res.status(200).json({
+          message: "User replaced successfully",
+          user: updatedUser,
+        });
+      } catch (error) {
+        if (error.code === 11000) {
+          return res.status(409).json({ message: "Email already exists" });
+        }
+
+        console.error("Error replacing user:", error);
+        res.status(500).json({ message: "Failed to replace user" });
+      }
+    });
 
     // Delete a user by id.
     app.delete("/api/users/:id", async (req, res) => {
