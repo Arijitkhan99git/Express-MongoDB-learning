@@ -17,12 +17,36 @@ const OBJECT_ID_REGEX = /^[0-9a-fA-F]{24}$/;
 // Fields a client is allowed to update.
 const UPDATABLE_FIELDS = ["first_name", "last_name", "email"];
 
+// Pagination defaults.
+const DEFAULT_LIMIT = 10;
+const MAX_LIMIT = 50;
+
+// Parses a query value like "2" into 2.
+// Returns the fallback if the value is missing, or null if it is invalid.
+function parsePositiveInt(value, fallback) {
+  if (value === undefined) return fallback;
+
+  // Must be a string of digits, no leading zero, no sign, at most 9 digits.
+  if (typeof value !== "string" || !/^[1-9]\d{0,8}$/.test(value)) {
+    return null;
+  }
+
+  return parseInt(value, 10);
+}
 
 // Escapes special regex characters so user input like "a.*" is treated as plain text.
 function escapeRegex(text) {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+// Middleware: rejects the request with 400 if :id is not a valid ObjectId string.
+// If it is valid, next() passes the request on to the route handler.
+function validateObjectId(req, res, next) {
+  if (!OBJECT_ID_REGEX.test(req.params.id)) {
+    return res.status(400).json({ message: "Invalid user id" });
+  }
+  next();
+}
 
 async function startServer() {
   try {
@@ -36,14 +60,27 @@ async function startServer() {
       res.send("Express API is running!");
     });
 
-   // Get all users, or search by name: GET /api/users?name=ari
+       // Get users with pagination and optional search:
+    // GET /api/users?page=2&limit=10&name=ari
     app.get("/api/users", async (req, res) => {
       try {
         const { name } = req.query;
+
+        const page = parsePositiveInt(req.query.page, 1);
+        const requestedLimit = parsePositiveInt(req.query.limit, DEFAULT_LIMIT);
+
+        if (page === null || requestedLimit === null) {
+          return res.status(400).json({
+            message: "page and limit must be positive whole numbers",
+          });
+        }
+
+        // Never let a client ask for more than MAX_LIMIT documents.
+        const limit = Math.min(requestedLimit, MAX_LIMIT);
+
         let filter = {};
 
         if (name !== undefined) {
-          // ?name=a&name=b gives an array, ?name[x]=1 gives an object. Only allow a string.
           if (typeof name !== "string") {
             return res.status(400).json({ message: "name must be a string" });
           }
@@ -54,8 +91,6 @@ async function startServer() {
             return res.status(400).json({ message: "name cannot be empty" });
           }
 
-          // Every word must match first_name OR last_name (case-insensitive, partial match).
-          // "ari kh" matches first_name "Arijit" AND last_name "Khan".
           filter = {
             $and: terms.map((term) => {
               const regex = new RegExp(escapeRegex(term), "i");
@@ -66,14 +101,30 @@ async function startServer() {
           };
         }
 
-        const users = await usersCollection
-          .find(filter)
-          .sort({ createdAt: -1 })
-          .limit(50)
-          .toArray();
+        // Run both queries at the same time.
+        const [users, total] = await Promise.all([
+          usersCollection
+            .find(filter)
+            .sort({ createdAt: -1, _id: -1 })
+            .skip((page - 1) * limit)
+            .limit(limit)
+            .toArray(),
+          usersCollection.countDocuments(filter),
+        ]);
 
-        // An empty search result is not an error: 200 with an empty array.
-        res.status(200).json(users);
+        const totalPages = Math.ceil(total / limit);
+
+        res.status(200).json({
+          data: users,
+          pagination: {
+            page,
+            limit,
+            total,
+            totalPages,
+            hasNextPage: page < totalPages,
+            hasPrevPage: page > 1,
+          },
+        });
       } catch (error) {
         console.error("Error fetching users:", error);
         res.status(500).json({ message: "Failed to fetch users" });
@@ -81,15 +132,11 @@ async function startServer() {
     });
 
     // Get one user by id.
-    app.get("/api/users/:id", async (req, res) => {
+    app.get("/api/users/:id", validateObjectId, async (req, res) => {
       try {
-        const { id } = req.params;
-
-        if (!OBJECT_ID_REGEX.test(id)) {
-          return res.status(400).json({ message: "Invalid user ID format" });
-        }
-
-        const user = await usersCollection.findOne({ _id: new ObjectId(id) });
+        const user = await usersCollection.findOne({
+          _id: new ObjectId(req.params.id),
+        });
 
         if (!user) {
           return res.status(404).json({ message: "User not found" });
@@ -149,15 +196,9 @@ async function startServer() {
       }
     });
 
-     // Partially update a user by id.
-    app.patch("/api/users/:id", async (req, res) => {
+    // Partially update a user by id.
+    app.patch("/api/users/:id", validateObjectId, async (req, res) => {
       try {
-        const { id } = req.params;
-
-        if (!OBJECT_ID_REGEX.test(id)) {
-          return res.status(400).json({ message: "Invalid user id" });
-        }
-
         const body = req.body ?? {};
         const updates = {};
 
@@ -194,7 +235,7 @@ async function startServer() {
         updates.updatedAt = new Date();
 
         const updatedUser = await usersCollection.findOneAndUpdate(
-          { _id: new ObjectId(id) },
+          { _id: new ObjectId(req.params.id) },
           { $set: updates },
           { returnDocument: "after" }
         );
@@ -218,15 +259,9 @@ async function startServer() {
       }
     });
 
-        // Replace a user completely by id.
-    app.put("/api/users/:id", async (req, res) => {
+    // Replace a user completely by id.
+    app.put("/api/users/:id", validateObjectId, async (req, res) => {
       try {
-        const { id } = req.params;
-
-        if (!OBJECT_ID_REGEX.test(id)) {
-          return res.status(400).json({ message: "Invalid user id" });
-        }
-
         const { first_name, last_name, email } = req.body ?? {};
 
         // PUT replaces the whole user, so all three fields are required.
@@ -249,7 +284,7 @@ async function startServer() {
           return res.status(400).json({ message: "Invalid email format" });
         }
 
-        const _id = new ObjectId(id);
+        const _id = new ObjectId(req.params.id);
 
         // Fetch the existing user so createdAt can be kept.
         const existing = await usersCollection.findOne({ _id });
@@ -296,16 +331,10 @@ async function startServer() {
     });
 
     // Delete a user by id.
-    app.delete("/api/users/:id", async (req, res) => {
+    app.delete("/api/users/:id", validateObjectId, async (req, res) => {
       try {
-        const { id } = req.params;
-
-        if (!OBJECT_ID_REGEX.test(id)) {
-          return res.status(400).json({ message: "Invalid user id" });
-        }
-
         const result = await usersCollection.deleteOne({
-          _id: new ObjectId(id),
+          _id: new ObjectId(req.params.id),
         });
 
         // deletedCount is 0 when no document matched the id.
@@ -315,7 +344,7 @@ async function startServer() {
 
         res.status(200).json({
           message: "User deleted successfully",
-          deletedId: id,
+          deletedId: req.params.id,
         });
       } catch (error) {
         console.error("Error deleting user:", error);
